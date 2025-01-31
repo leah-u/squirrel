@@ -63,6 +63,39 @@ pub fn add_types(
 ) -> Result(TypedQuery, Error) {
   let UntypedQuery(file:, name:, comment:, content:, starting_line:) = query
 
+  // Quick and dirty hack to allow nullable parameters in insert queries
+  // Looks for a comment like this: '-- nullable: $1, $3' in the sql file
+  // and makes the specified parameters nullable
+  let nullable_params =
+    comment
+    |> list.find_map(fn(comment) {
+      case comment {
+        "nullable:" <> params -> {
+          params
+          |> string.split(",")
+          |> list.try_map(fn(arg) {
+            case string.trim(arg) {
+              "$" <> n -> int.parse(n)
+              _ -> Error(Nil)
+            }
+          })
+          |> result.map(set.from_list)
+        }
+        _ -> Error(Nil)
+      }
+    })
+  let params = case nullable_params {
+    Error(_) -> params
+    Ok(nullable_params) ->
+      params
+      |> list.index_map(fn(type_, i) {
+        case nullable_params |> set.contains(i + 1) {
+          True -> gleam.Option(type_)
+          False -> type_
+        }
+      })
+  }
+
   case duplicate_names(returns) {
     [] ->
       Ok(TypedQuery(
