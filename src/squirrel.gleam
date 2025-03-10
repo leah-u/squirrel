@@ -21,7 +21,7 @@ import squirrel/internal/error.{
   OutdatedFile,
 }
 import squirrel/internal/project
-import squirrel/internal/query.{type TypedQuery}
+import squirrel/internal/query.{type QueryFile, QueryFile}
 import term_size
 
 const squirrel_version = "v3.0.1"
@@ -302,7 +302,7 @@ fn walk(from: String) -> Dict(String, List(String)) {
 fn generate_queries(
   directories: Dict(String, List(String)),
   connection: postgres.ConnectionOptions,
-) -> Dict(String, #(List(TypedQuery), List(Error))) {
+) -> Dict(String, #(QueryFile, List(Error))) {
   use _directory, files <- dict.map_values(directories)
 
   let #(queries, errors) =
@@ -310,8 +310,11 @@ fn generate_queries(
     |> result.partition
 
   case postgres.main(queries, connection) {
-    Error(error) -> #([], [error, ..errors])
-    Ok(#(queries, type_errors)) -> #(queries, list.append(errors, type_errors))
+    Error(error) -> #(QueryFile([], []), [error, ..errors])
+    Ok(#(queries, type_errors)) -> {
+      let #(query_file, record_errors) = query.query_records(queries)
+      #(query_file, list.flatten([errors, type_errors, record_errors]))
+    }
   }
 }
 
@@ -321,21 +324,21 @@ fn generate_queries(
 /// took place.
 ///
 fn write_queries(
-  queries: Dict(String, #(List(TypedQuery), List(Error))),
+  queries: Dict(String, #(QueryFile, List(Error))),
 ) -> Dict(String, #(Int, List(Error))) {
   use directory, #(queries, errors) <- dict.map_values(queries)
   let output_file = directory_to_output_file(directory)
   case write_queries_to_file(queries, to: output_file) {
     Ok(n) -> #(n, errors)
-    Error(error) -> #(list.length(queries), [error, ..errors])
+    Error(error) -> #(list.length(queries.queries), [error, ..errors])
   }
 }
 
 fn write_queries_to_file(
-  queries: List(TypedQuery),
+  queries: QueryFile,
   to file: String,
 ) -> Result(Int, Error) {
-  use <- bool.guard(when: queries == [], return: Ok(0))
+  use <- bool.guard(when: queries.queries == [], return: Ok(0))
   let directory = filepath.directory_name(file)
   let _ = simplifile.create_directory_all(directory)
 
@@ -345,7 +348,7 @@ fn write_queries_to_file(
     |> result.map_error(CannotWriteToFile(file, _))
 
   use _ <- result.try(try_write)
-  Ok(list.length(queries))
+  Ok(list.length(queries.queries))
 }
 
 fn directory_to_output_file(directory: String) -> String {
@@ -356,7 +359,7 @@ fn directory_to_output_file(directory: String) -> String {
 // --- MODE: CHECK GENERATED CODE ----------------------------------------------
 
 fn check_queries(
-  queries: Dict(String, #(List(query.TypedQuery), List(Error))),
+  queries: Dict(String, #(QueryFile, List(Error))),
 ) -> Dict(String, Result(Nil, List(Error))) {
   use directory, #(queries, errors) <- dict.map_values(queries)
   case errors {
@@ -393,10 +396,7 @@ pub type CheckResult {
 /// > account! If the only thing that changed are comments and/or formatting
 /// > two files will still be considered the same.
 ///
-fn check_queries_code(
-  queries: List(TypedQuery),
-  actual_code: String,
-) -> CheckResult {
+fn check_queries_code(queries: QueryFile, actual_code: String) -> CheckResult {
   let expected_code = query.generate_code(queries, squirrel_version)
   compare_code_snippets(actual_code, expected_code)
 }

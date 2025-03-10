@@ -50,6 +50,7 @@ fn find_postgres_type_query() -> UntypedQuery {
     file: "",
     starting_line: 1,
     name:,
+    returning_name: name,
     comment: [],
     content: "
 select
@@ -96,6 +97,7 @@ fn find_enum_variants_query() -> UntypedQuery {
     file: "",
     starting_line: 1,
     name:,
+    returning_name: name,
     comment: [],
     content: "
 select
@@ -117,6 +119,7 @@ fn find_column_nullability_query() -> UntypedQuery {
     file: "",
     starting_line: 1,
     name:,
+    returning_name: name,
     comment: [],
     content: "
 select
@@ -1218,7 +1221,14 @@ fn with_cached_column(
 // --- HELPERS TO BUILD ERRORS -------------------------------------------------
 
 fn unsupported_type_error(query: UntypedQuery, type_: String) -> Error {
-  let UntypedQuery(content:, file:, name:, starting_line:, comment: _) = query
+  let UntypedQuery(
+    content:,
+    file:,
+    name:,
+    returning_name: _,
+    starting_line:,
+    comment: _,
+  ) = query
   QueryHasUnsupportedType(
     file:,
     name: gleam.value_identifier_to_string(name),
@@ -1229,7 +1239,14 @@ fn unsupported_type_error(query: UntypedQuery, type_: String) -> Error {
 }
 
 fn invalid_enum_error(query: UntypedQuery, enum_name: String, reason: EnumError) {
-  let UntypedQuery(content:, file:, name: _, starting_line:, comment: _) = query
+  let UntypedQuery(
+    content:,
+    file:,
+    name: _,
+    returning_name: _,
+    starting_line:,
+    comment: _,
+  ) = query
   QueryHasInvalidEnum(file:, content:, starting_line:, enum_name:, reason:)
 }
 
@@ -1240,7 +1257,14 @@ fn cannot_parse_error(
   additional_error_message additional_error_message: Option(String),
   pointer pointer: Option(Pointer),
 ) -> Error {
-  let UntypedQuery(content:, file:, name:, starting_line:, comment: _) = query
+  let UntypedQuery(
+    content:,
+    file:,
+    name:,
+    returning_name: _,
+    starting_line:,
+    comment: _,
+  ) = query
   CannotParseQuery(
     content:,
     file:,
@@ -1258,7 +1282,14 @@ fn invalid_column_error(
   column_name: String,
   reason: ValueIdentifierError,
 ) -> Error {
-  let UntypedQuery(name: _, file:, content:, starting_line:, comment: _) = query
+  let UntypedQuery(
+    name: _,
+    returning_name: _,
+    file:,
+    content:,
+    starting_line:,
+    comment: _,
+  ) = query
   QueryHasInvalidColumn(
     file:,
     column_name:,
