@@ -17,6 +17,14 @@ import squirrel/internal/error.{
 import squirrel/internal/gleam.{type EnumVariant, type TypeIdentifier}
 import tote/bag
 
+pub type QueryFile {
+  QueryFile(queries: List(TypedQuery), records: List(Record))
+}
+
+pub type Record {
+  Record(name: gleam.ValueIdentifier, fields: List(gleam.Field))
+}
+
 /// A query that still needs to go through the type checking process.
 ///
 pub type UntypedQuery {
@@ -30,6 +38,7 @@ pub type UntypedQuery {
     /// The name of the query, it must be a valid Gleam identifier.
     ///
     name: gleam.ValueIdentifier,
+    returning_name: gleam.ValueIdentifier,
     /// Any comment lines that were preceding the query in the file.
     ///
     comment: List(String),
@@ -47,6 +56,7 @@ pub type TypedQuery {
     file: String,
     starting_line: Int,
     name: gleam.ValueIdentifier,
+    returning_name: gleam.ValueIdentifier,
     comment: List(String),
     content: String,
     params: List(gleam.Type),
@@ -61,7 +71,14 @@ pub fn add_types(
   params params: List(gleam.Type),
   returns returns: List(gleam.Field),
 ) -> Result(TypedQuery, Error) {
-  let UntypedQuery(file:, name:, comment:, content:, starting_line:) = query
+  let UntypedQuery(
+    file:,
+    name:,
+    returning_name:,
+    comment:,
+    content:,
+    starting_line:,
+  ) = query
 
   // Quick and dirty hack to allow nullable parameters in insert queries
   // Looks for a comment like this: '-- nullable: $1, $3' in the sql file
@@ -101,6 +118,7 @@ pub fn add_types(
       Ok(TypedQuery(
         file:,
         name:,
+        returning_name:,
         comment:,
         content:,
         starting_line:,
@@ -143,6 +161,15 @@ pub fn from_file(file: String) -> Result(UntypedQuery, Error) {
     |> result.map_error(CannotReadFile(file, _))
 
   use content <- result.try(read_file)
+  let comment = take_comment(content)
+
+  let custom_name =
+    list.find_map(comment, fn(comment) {
+      case comment {
+        "returning:" <> name -> Ok(string.trim(name))
+        _ -> Error(Nil)
+      }
+    })
 
   // A query always starts at the top of the file.
   // If in the future I want to add support for many queries per file this
@@ -150,6 +177,7 @@ pub fn from_file(file: String) -> Result(UntypedQuery, Error) {
   let file_name =
     filepath.base_name(file)
     |> filepath.strip_extension
+
   let name =
     gleam.value_identifier(file_name)
     |> result.map_error(QueryFileHasInvalidName(
@@ -159,13 +187,40 @@ pub fn from_file(file: String) -> Result(UntypedQuery, Error) {
         |> option.from_result,
     ))
 
+  let returning_name = case custom_name {
+    Error(_) ->
+      result.try(name, fn(name) {
+        gleam.value_identifier_to_string(name)
+        |> string.append("_row")
+        |> gleam.value_identifier
+        |> result.map_error(QueryFileHasInvalidName(
+          file:,
+          reason: _,
+          suggested_name: gleam.similar_value_identifier_string(file_name)
+            |> option.from_result,
+        ))
+      })
+    Ok(name) ->
+      gleam.type_identifier(name)
+      |> result.map(gleam.type_identifier_to_value_identifier)
+      |> result.map_error(error.ReturnsParameterHasInvalidName(
+        file:,
+        reason: _,
+        suggested_name: gleam.similar_value_identifier_string(name)
+          |> option.from_result,
+      ))
+  }
+
   use name <- result.try(name)
+  use returning_name <- result.try(returning_name)
+
   Ok(UntypedQuery(
     file:,
     starting_line: 1,
     name:,
+    returning_name:,
     content:,
-    comment: take_comment(content),
+    comment:,
   ))
 }
 
@@ -192,6 +247,7 @@ type CodeGenState {
   CodeGenState(
     imports: Dict(String, Set(String)),
     needs_uuid_decoder: Bool,
+    needs_nil_decoder: Bool,
     // All the enums used in the module, this maps from name of the enum to a
     // list of its variants and what kind of helpers need to be generated for
     // the enum encoding/decoding.
@@ -242,6 +298,7 @@ fn default_codegen_state() {
   CodeGenState(
     imports: dict.new(),
     needs_uuid_decoder: False,
+    needs_nil_decoder: False,
     enums: dict.new(),
   )
   |> import_module("gleam/dynamic/decode")
@@ -386,22 +443,58 @@ fn gleam_type_to_field_type(
   }
 }
 
+pub fn query_records(queries: List(TypedQuery)) -> #(QueryFile, List(Error)) {
+  let #(records, errors) = {
+    use #(records, errors), query <- list.fold(queries, #(dict.new(), []))
+    case dict.get(records, query.returning_name) {
+      Error(_) -> #(
+        dict.insert(
+          records,
+          query.returning_name,
+          Record(query.returning_name, query.returns),
+        ),
+        errors,
+      )
+      Ok(record) if record.fields == query.returns -> {
+        #(records, errors)
+      }
+      Ok(_) -> #(records, [error.RecordAlreadyExists, ..errors])
+    }
+  }
+  let records = dict.values(records)
+  #(QueryFile(queries:, records:), errors)
+}
+
 /// Generates the code for a single file containing a bunch of typed queries.
 ///
-pub fn generate_code(queries: List(TypedQuery), version: String) -> String {
+pub fn generate_code(file: QueryFile, version: String) -> String {
+  let state = default_codegen_state()
+  let #(state, records_docs) = {
+    use #(state, docs), record <- list.fold(
+      over: file.records,
+      from: #(state, []),
+    )
+    let #(state, doc) = record_doc(state, version, record)
+    #(state, [doc, ..docs])
+  }
+  let records_docs = list.reverse(records_docs)
   let #(state, queries_docs) = {
-    let state = default_codegen_state()
-    use #(state, docs), query <- list.fold(over: queries, from: #(state, []))
+    use #(state, docs), query <- list.fold(
+      over: file.queries,
+      from: #(state, []),
+    )
     let #(state, doc) = query_doc(state, version, query)
     #(state, [doc, ..docs])
   }
   let queries_docs = list.reverse(queries_docs)
 
-  let CodeGenState(imports:, needs_uuid_decoder:, enums:) = state
+  let CodeGenState(imports:, needs_uuid_decoder:, needs_nil_decoder:, enums:) =
+    state
 
   let utils =
     []
     |> prepend_if(needs_uuid_decoder, doc.from_string(uuid_decoder))
+    |> prepend_if(needs_nil_decoder, doc.from_string(nil_decoder))
 
   // We always want to output the imports and the code for the queries.
   // But in case we also need some helpers we add a final section to our file
@@ -409,6 +502,8 @@ pub fn generate_code(queries: List(TypedQuery), version: String) -> String {
   let code =
     [
       imports_doc(imports),
+      doc.lines(2),
+      doc.join(records_docs, with: doc.lines(2)),
       doc.lines(2),
       doc.join(queries_docs, with: doc.lines(2)),
     ]
@@ -494,6 +589,7 @@ fn query_doc(
   let TypedQuery(
     file: _,
     name:,
+    returning_name:,
     content:,
     comment: _,
     params:,
@@ -501,15 +597,11 @@ fn query_doc(
     starting_line: _,
   ) = query
 
-  let constructor_name =
-    gleam.value_identifier_to_type_identifier(name)
-    |> gleam.type_identifier_to_string
-    |> string.append("Row")
+  let uses_nil_decoder = list.is_empty(returns)
 
-  let record_result = record_doc(state, version, constructor_name, query)
-  let #(state, record) = case record_result {
-    Ok(#(state, record)) -> #(state, doc.append(record, doc.lines(2)))
-    Error(_) -> #(state, doc.empty)
+  let state = case uses_nil_decoder {
+    False -> state
+    True -> CodeGenState(..state, needs_nil_decoder: True)
   }
 
   let #(state, inputs, encoders) = {
@@ -524,20 +616,21 @@ fn query_doc(
   let inputs = list.reverse(inputs)
   let encoders = list.reverse(encoders)
 
-  let #(state, decoder) = decoder_doc(state, constructor_name, returns)
+  let decoder_name = case uses_nil_decoder {
+    True -> "nil_decoder"
+    False -> gleam.value_identifier_to_string(returning_name) <> "_decoder"
+  }
 
   let code =
     doc.concat([
-      record,
       doc.from_string(function_doc(version, query)),
       doc.line,
       fun_doc(Public, gleam.value_identifier_to_string(name), ["db", ..inputs], [
-        let_var("decoder", decoder) |> doc.append(doc.from_string("\n")),
         string_doc(content)
-          |> pipe_call_doc("pog.query", _, [])
-          |> pipe_all_encoders(encoders)
-          |> pipe_call_doc("pog.returning", _, [doc.from_string("decoder")])
-          |> pipe_call_doc("pog.execute", _, [doc.from_string("db")]),
+        |> pipe_call_doc("pog.query", _, [])
+        |> pipe_all_encoders(encoders)
+        |> pipe_call_doc("pog.returning", _, [call_doc(decoder_name, [])])
+        |> pipe_call_doc("pog.execute", _, [doc.from_string("db")]),
       ]),
     ])
 
@@ -578,23 +671,30 @@ fn function_doc(version: String, query: TypedQuery) -> String {
 fn record_doc(
   state: CodeGenState,
   version: String,
-  type_name: String,
-  query: TypedQuery,
-) -> Result(#(CodeGenState, Document), Nil) {
-  let TypedQuery(name:, returns:, file:, ..) = query
-  use <- bool.guard(when: returns == [], return: Error(Nil))
+  record: Record,
+) -> #(CodeGenState, Document) {
+  let Record(name:, fields:) = record
+  use <- bool.guard(when: fields == [], return: #(state, doc.empty))
 
-  let function_name = gleam.value_identifier_to_string(name)
+  let type_name =
+    gleam.value_identifier_to_type_identifier(name)
+    |> gleam.type_identifier_to_string
+
+  let #(state, decoder) = decoder_doc(state, record)
+
   let record_doc =
-    "/// A row you get from running the `" <> function_name <> "` query
-/// defined in `" <> file <> "`.
-///
-/// > 🐿️ This type definition was generated automatically using " <> version <> " of the
+    //     "/// A row you get from running the `" <> function_name <> "` query
+    // /// defined in `" <> file <> "`.
+    // ///"
+
+    "/// > 🐿️ This type definition was generated automatically using "
+    <> version
+    <> " of the
 /// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
 ///"
 
   let #(state, fields) = {
-    use #(state, fields), field <- list.fold(returns, from: #(state, []))
+    use #(state, fields), field <- list.fold(fields, from: #(state, []))
     let label =
       doc.from_string(gleam.value_identifier_to_string(field.label) <> ": ")
     let #(state, field_type) = gleam_type_to_field_type(state, field.type_)
@@ -618,10 +718,12 @@ fn record_doc(
       ]
         |> doc.concat
         |> doc.group,
+      doc.lines(2),
+      decoder,
     ]
     |> doc.concat
 
-  Ok(#(state, result))
+  #(state, result)
 }
 
 /// Returns the document for the definition and encoding/decoding of all enums
@@ -780,9 +882,11 @@ fn uuid_decoder() {
   }
 }"
 
-/// A decoder that discards its value and always returns `Nil` instead.
+const nil_decoder = "/// A decoder that discards its value and always returns `Nil` instead.
 ///
-const nil_decoder = "decode.map(decode.dynamic, fn(_) { Nil })"
+fn nil_decoder() {
+  decode.map(decode.dynamic, fn(_) { Nil })
+}"
 
 /// A pretty printed decoder that decodes an n-item dynamic tuple with the given
 /// constructor wrapping the returned rows from a query.
@@ -790,16 +894,13 @@ const nil_decoder = "decode.map(decode.dynamic, fn(_) { Nil })"
 /// If the query returns no columns (that is `returns == []`), then we default
 /// to building decoder that always returns `Nil`.
 ///
-fn decoder_doc(
-  state: CodeGenState,
-  constructor: String,
-  returns: List(gleam.Field),
-) -> #(CodeGenState, Document) {
+fn decoder_doc(state: CodeGenState, record: Record) -> #(CodeGenState, Document) {
+  let Record(name:, fields:) = record
   let fallback = #(state, doc.from_string(nil_decoder))
-  use <- bool.guard(when: returns == [], return: fallback)
+  use <- bool.guard(when: fields == [], return: fallback)
 
   let #(state, parameters, labelled_names) = {
-    use acc, field, i <- list.index_fold(returns, #(state, [], []))
+    use acc, field, i <- list.index_fold(fields, #(state, [], []))
     let #(state, parameters, labelled_names) = acc
 
     let label = gleam.value_identifier_to_string(field.label)
@@ -817,10 +918,23 @@ fn decoder_doc(
   let parameters = list.reverse(parameters)
   let labelled_names = list.reverse(labelled_names)
 
+  let constructor =
+    gleam.value_identifier_to_type_identifier(name)
+    |> gleam.type_identifier_to_string
+
   let success_line =
     nested_calls_doc("decode.success", constructor, labelled_names)
 
-  let doc = block(list.append(parameters, [success_line]))
+  let function_name = gleam.value_identifier_to_string(name) <> "_decoder"
+
+  let doc =
+    [
+      doc.from_string("fn " <> function_name <> "() "),
+      block(list.append(parameters, [success_line])),
+    ]
+    |> doc.concat
+    |> doc.group
+
   #(state, doc)
 }
 

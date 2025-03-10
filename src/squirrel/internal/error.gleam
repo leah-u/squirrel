@@ -119,6 +119,12 @@ pub type Error {
     reason: ValueIdentifierError,
   )
 
+  ReturnsParameterHasInvalidName(
+    file: String,
+    suggested_name: Option(String),
+    reason: TypeIdentifierError,
+  )
+
   /// If a query returns a column that is not a valid Gleam identifier. Instead
   /// of trying to magically come up with a name we fail and report the error.
   ///
@@ -182,6 +188,8 @@ pub type Error {
     starting_line: Int,
     names: List(String),
   )
+
+  RecordAlreadyExists
 
   /// If the postgres server sends in a query explanantion in a format that I
   /// cannot parse.
@@ -450,6 +458,20 @@ contain lowercase letters, numbers and underscores." <> case suggested_name {
         None -> ""
       })
 
+    ReturnsParameterHasInvalidName(file:, suggested_name:, reason: _) ->
+      printable_error("Return type parameter with invalid name")
+      |> add_paragraph(
+        "File " <> style_file(file) <> " doesn't have a valid name.
+The name of a file is used to generate a corresponding Gleam function, so it
+should be a valid Gleam name.",
+      )
+      |> hint("A file name must start with a lowercase letter and can only
+contain lowercase letters, numbers and underscores." <> case suggested_name {
+        Some(name) ->
+          "\nMaybe try renaming it to " <> style_inline_code(name) <> "?"
+        None -> ""
+      })
+
     QueryHasInvalidColumn(
       file:,
       column_name:,
@@ -623,6 +645,8 @@ This is most definitely a bug!",
         <> " is outdated, try running `gleam run -m squirrel` to generate a new
 up to date version.",
       )
+    RecordAlreadyExists ->
+      printable_error("Record was already defined with different fields")
   }
 
   printable_error_to_doc(printable_error)
