@@ -168,7 +168,7 @@ pub fn from_file(file: String) -> Result(UntypedQuery, Error) {
   let custom_name =
     list.find_map(comment, fn(comment) {
       case comment {
-        "returns:" <> name -> Ok(string.trim(name))
+        "returning:" <> name -> Ok(string.trim(name))
         _ -> Error(Nil)
       }
     })
@@ -891,7 +891,7 @@ fn decoder_doc(state: CodeGenState, record: Record) -> #(CodeGenState, Document)
 
   let doc =
     [
-      doc.from_string("pub fn " <> function_name <> "() "),
+      doc.from_string("fn " <> function_name <> "() "),
       block([
         doc.join(parameters, with: doc.line),
         doc.line,
